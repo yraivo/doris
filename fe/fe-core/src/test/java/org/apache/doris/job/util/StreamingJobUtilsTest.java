@@ -27,12 +27,15 @@ import org.apache.doris.catalog.PrimitiveType;
 import org.apache.doris.catalog.ScalarType;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.datasource.jdbc.client.JdbcClient;
+import org.apache.doris.datasource.jdbc.util.JdbcFieldSchema;
 import org.apache.doris.job.cdc.DataSourceConfigKeys;
 import org.apache.doris.job.common.DataSourceType;
 import org.apache.doris.job.exception.JobException;
 import org.apache.doris.mysql.privilege.AccessControllerManager;
 import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.nereids.exceptions.AnalysisException;
+import org.apache.doris.nereids.trees.plans.commands.CreateTableCommand;
+import org.apache.doris.nereids.trees.plans.commands.info.ColumnDefinition;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.GlobalVariable;
 
@@ -48,8 +51,11 @@ import org.mockito.MockitoAnnotations;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Collectors;
 
 public class StreamingJobUtilsTest {
 
@@ -397,6 +403,299 @@ public class StreamingJobUtilsTest {
                     .get("source_table").isPresent());
         } finally {
             GlobalVariable.lowerCaseTableNames = originalLowerCaseTableNames;
+        }
+    }
+
+    private List<Column> buildPostGisBuildingColumns() {
+        return Arrays.asList(
+                new Column("id", ScalarType.createType(PrimitiveType.BIGINT)),
+                new Column("buildingid", ScalarType.createType(PrimitiveType.BIGINT)),
+                new Column("buildingdata", ScalarType.createStringType()),
+                new Column("buildingclass", ScalarType.createType(PrimitiveType.BIGINT)),
+                new Column("buildingname", ScalarType.createVarcharType(255)),
+                new Column("geometry", new ScalarType(PrimitiveType.UNSUPPORTED)),
+                new Column("create_by", ScalarType.createVarcharType(32)),
+                new Column("create_time", ScalarType.createDatetimeV2Type(6)),
+                new Column("update_by", ScalarType.createVarcharType(32)),
+                new Column("update_time", ScalarType.createDatetimeV2Type(6)),
+                new Column("processdata", ScalarType.createStringType()),
+                new Column("lng", ScalarType.createDecimalV3Type(16, 8)),
+                new Column("lat", ScalarType.createDecimalV3Type(16, 8)));
+    }
+
+    @Test
+    public void testGenerateCreateTableCmdsExcludesUnsupportedPostGisGeometryColumn() throws Exception {
+        Map<String, String> properties = new HashMap<>();
+        properties.put(DataSourceConfigKeys.SCHEMA, "public");
+        properties.put(DataSourceConfigKeys.INCLUDE_TABLES, "building");
+        properties.put(DataSourceConfigKeys.TABLE + ".building."
+                + DataSourceConfigKeys.TABLE_EXCLUDE_COLUMNS_SUFFIX, "geometry");
+
+        Database targetDatabase = new Database(1L, "szt_ods");
+        Env env = Mockito.mock(Env.class);
+        InternalCatalog internalCatalog = Mockito.mock(InternalCatalog.class);
+        Mockito.when(env.getInternalCatalog()).thenReturn(internalCatalog);
+        Mockito.when(internalCatalog.getDbNullable("szt_ods")).thenReturn(targetDatabase);
+        Mockito.when(jdbcClient.getTablesNameList("public")).thenReturn(Arrays.asList("building"));
+        Mockito.when(jdbcClient.getPrimaryKeys("public", "building")).thenReturn(Arrays.asList("id"));
+        Mockito.when(jdbcClient.getColumnsFromJdbc("public", "building"))
+                .thenReturn(buildPostGisBuildingColumns());
+
+        try (MockedStatic<Env> mockedEnv = Mockito.mockStatic(Env.class);
+                MockedStatic<StreamingJobUtils> utils = Mockito.mockStatic(StreamingJobUtils.class,
+                        Mockito.CALLS_REAL_METHODS)) {
+            mockedEnv.when(Env::getCurrentEnv).thenReturn(env);
+            utils.when(() -> StreamingJobUtils.getJdbcClient(DataSourceType.POSTGRES, properties))
+                    .thenReturn(jdbcClient);
+
+            LinkedHashMap<String, Optional<CreateTableCommand>> cmds = StreamingJobUtils.generateCreateTableCmds(
+                    "szt_ods", DataSourceType.POSTGRES, properties, new HashMap<>());
+            Assertions.assertTrue(cmds.containsKey("building"));
+            Assertions.assertTrue(cmds.get("building").isPresent());
+            List<ColumnDefinition> defs = cmds.get("building").get().getCreateTableInfo().getColumnDefinitions();
+            List<String> colNames = defs.stream().map(ColumnDefinition::getName).collect(Collectors.toList());
+            Assertions.assertEquals(12, colNames.size());
+            Assertions.assertFalse(colNames.contains("geometry"));
+            Assertions.assertEquals("id", colNames.get(0));
+            ColumnDefinition buildingName = defs.stream()
+                    .filter(c -> "buildingname".equals(c.getName()))
+                    .findFirst()
+                    .orElseThrow(AssertionError::new);
+            Assertions.assertEquals(765, buildingName.getType().toCatalogDataType().getLength());
+            Mockito.verify(jdbcClient).closeClient();
+        }
+    }
+
+    @Test
+    public void testGenerateCreateTableCmdsStillRejectsNonExcludedUnsupportedColumn() {
+        Database targetDatabase = new Database(1L, "szt_ods");
+        Env env = Mockito.mock(Env.class);
+        InternalCatalog internalCatalog = Mockito.mock(InternalCatalog.class);
+        Mockito.when(env.getInternalCatalog()).thenReturn(internalCatalog);
+        Mockito.when(internalCatalog.getDbNullable("szt_ods")).thenReturn(targetDatabase);
+        Mockito.when(jdbcClient.getTablesNameList("public")).thenReturn(Arrays.asList("building"));
+        Mockito.when(jdbcClient.getPrimaryKeys("public", "building")).thenReturn(Arrays.asList("id"));
+
+        Map<String, String> withoutExclude = new HashMap<>();
+        withoutExclude.put(DataSourceConfigKeys.SCHEMA, "public");
+        withoutExclude.put(DataSourceConfigKeys.INCLUDE_TABLES, "building");
+
+        Map<String, String> excludeOther = new HashMap<>(withoutExclude);
+        excludeOther.put(DataSourceConfigKeys.TABLE + ".building."
+                + DataSourceConfigKeys.TABLE_EXCLUDE_COLUMNS_SUFFIX, "buildingname");
+
+        try (MockedStatic<Env> mockedEnv = Mockito.mockStatic(Env.class);
+                MockedStatic<StreamingJobUtils> utils = Mockito.mockStatic(StreamingJobUtils.class,
+                        Mockito.CALLS_REAL_METHODS)) {
+            mockedEnv.when(Env::getCurrentEnv).thenReturn(env);
+            utils.when(() -> StreamingJobUtils.getJdbcClient(DataSourceType.POSTGRES, withoutExclude))
+                    .thenReturn(jdbcClient);
+            utils.when(() -> StreamingJobUtils.getJdbcClient(DataSourceType.POSTGRES, excludeOther))
+                    .thenReturn(jdbcClient);
+
+            Mockito.when(jdbcClient.getColumnsFromJdbc("public", "building"))
+                    .thenReturn(buildPostGisBuildingColumns());
+            IllegalArgumentException errNoExclude = Assertions.assertThrows(IllegalArgumentException.class,
+                    () -> StreamingJobUtils.generateCreateTableCmds(
+                            "szt_ods", DataSourceType.POSTGRES, withoutExclude, new HashMap<>()));
+            Assertions.assertTrue(errNoExclude.getMessage().contains("Unsupported column type"));
+            Assertions.assertTrue(errNoExclude.getMessage().contains("geometry"));
+
+            Mockito.when(jdbcClient.getColumnsFromJdbc("public", "building"))
+                    .thenReturn(buildPostGisBuildingColumns());
+            IllegalArgumentException errExcludeOther = Assertions.assertThrows(IllegalArgumentException.class,
+                    () -> StreamingJobUtils.generateCreateTableCmds(
+                            "szt_ods", DataSourceType.POSTGRES, excludeOther, new HashMap<>()));
+            Assertions.assertTrue(errExcludeOther.getMessage().contains("Unsupported column type"));
+            Assertions.assertTrue(errExcludeOther.getMessage().contains("geometry"));
+        }
+    }
+
+    @Test
+    public void testGenerateCreateTableCmdsHandlesMultipleUnsupportedColumnsAndCustomTarget() throws Exception {
+        Database targetDatabase = new Database(1L, "szt_ods");
+        Env env = Mockito.mock(Env.class);
+        InternalCatalog internalCatalog = Mockito.mock(InternalCatalog.class);
+        Mockito.when(env.getInternalCatalog()).thenReturn(internalCatalog);
+        Mockito.when(internalCatalog.getDbNullable("szt_ods")).thenReturn(targetDatabase);
+        Mockito.when(jdbcClient.getTablesNameList("public")).thenReturn(Arrays.asList("building_multi"));
+        Mockito.when(jdbcClient.getPrimaryKeys("public", "building_multi"))
+                .thenReturn(Arrays.asList("pk2", "pk1"));
+
+        Map<String, String> excludeOnlyFirst = new HashMap<>();
+        excludeOnlyFirst.put(DataSourceConfigKeys.SCHEMA, "public");
+        excludeOnlyFirst.put(DataSourceConfigKeys.INCLUDE_TABLES, "building_multi");
+        excludeOnlyFirst.put(DataSourceConfigKeys.TABLE + ".building_multi."
+                + DataSourceConfigKeys.TABLE_EXCLUDE_COLUMNS_SUFFIX, "leading_geom");
+
+        Map<String, String> excludeBoth = new HashMap<>();
+        excludeBoth.put(DataSourceConfigKeys.SCHEMA, "public");
+        excludeBoth.put(DataSourceConfigKeys.INCLUDE_TABLES, "building_multi");
+        excludeBoth.put(DataSourceConfigKeys.TABLE + ".building_multi."
+                + DataSourceConfigKeys.TABLE_TARGET_TABLE_SUFFIX, "building_ods");
+        excludeBoth.put(DataSourceConfigKeys.TABLE + ".building_multi."
+                + DataSourceConfigKeys.TABLE_EXCLUDE_COLUMNS_SUFFIX, " leading_geom , trailing_geom ");
+
+        try (MockedStatic<Env> mockedEnv = Mockito.mockStatic(Env.class);
+                MockedStatic<StreamingJobUtils> utils = Mockito.mockStatic(StreamingJobUtils.class,
+                        Mockito.CALLS_REAL_METHODS)) {
+            mockedEnv.when(Env::getCurrentEnv).thenReturn(env);
+            utils.when(() -> StreamingJobUtils.getJdbcClient(DataSourceType.POSTGRES, excludeOnlyFirst))
+                    .thenReturn(jdbcClient);
+            utils.when(() -> StreamingJobUtils.getJdbcClient(DataSourceType.POSTGRES, excludeBoth))
+                    .thenReturn(jdbcClient);
+
+            Mockito.when(jdbcClient.getColumnsFromJdbc("public", "building_multi"))
+                    .thenReturn(Arrays.asList(
+                            new Column("leading_geom", new ScalarType(PrimitiveType.UNSUPPORTED)),
+                            new Column("pk1", ScalarType.createType(PrimitiveType.BIGINT)),
+                            new Column("payload", ScalarType.createType(PrimitiveType.VARBINARY)),
+                            new Column("pk2", ScalarType.createStringType()),
+                            new Column("event_ts", ScalarType.createTimeStampTzType(6)),
+                            new Column("trailing_geom", new ScalarType(PrimitiveType.UNSUPPORTED))));
+            IllegalArgumentException partialErr = Assertions.assertThrows(IllegalArgumentException.class,
+                    () -> StreamingJobUtils.generateCreateTableCmds(
+                            "szt_ods", DataSourceType.POSTGRES, excludeOnlyFirst, new HashMap<>()));
+            Assertions.assertTrue(partialErr.getMessage().contains("trailing_geom"),
+                    () -> "Expected error on trailing_geom, got: " + partialErr.getMessage());
+            Assertions.assertFalse(partialErr.getMessage().contains("leading_geom"),
+                    () -> "Excluded leading_geom should not fail, got: " + partialErr.getMessage());
+
+            Mockito.when(jdbcClient.getColumnsFromJdbc("public", "building_multi"))
+                    .thenReturn(Arrays.asList(
+                            new Column("leading_geom", new ScalarType(PrimitiveType.UNSUPPORTED)),
+                            new Column("pk1", ScalarType.createType(PrimitiveType.BIGINT)),
+                            new Column("payload", ScalarType.createType(PrimitiveType.VARBINARY)),
+                            new Column("pk2", ScalarType.createStringType()),
+                            new Column("event_ts", ScalarType.createTimeStampTzType(6)),
+                            new Column("trailing_geom", new ScalarType(PrimitiveType.UNSUPPORTED))));
+            LinkedHashMap<String, Optional<CreateTableCommand>> cmds = StreamingJobUtils.generateCreateTableCmds(
+                    "szt_ods", DataSourceType.POSTGRES, excludeBoth, new HashMap<>());
+            CreateTableCommand cmd = cmds.get("building_multi").orElseThrow(AssertionError::new);
+            Assertions.assertEquals("building_ods", cmd.getCreateTableInfo().getTableName());
+            List<ColumnDefinition> defs = cmd.getCreateTableInfo().getColumnDefinitions();
+            Assertions.assertEquals(Arrays.asList("pk2", "pk1", "payload", "event_ts"),
+                    defs.stream().map(ColumnDefinition::getName).collect(Collectors.toList()));
+            Assertions.assertEquals(PrimitiveType.VARCHAR,
+                    defs.get(0).getType().toCatalogDataType().getPrimitiveType());
+            Assertions.assertEquals(PrimitiveType.STRING,
+                    defs.get(2).getType().toCatalogDataType().getPrimitiveType());
+            Assertions.assertEquals(ScalarType.createDatetimeV2Type(6), defs.get(3).getType().toCatalogDataType());
+        }
+    }
+
+    @Test
+    public void testGenerateCreateTableCmdsPreservesExcludeValidationWithUnsupportedColumn() {
+        Database targetDatabase = new Database(1L, "szt_ods");
+        Env env = Mockito.mock(Env.class);
+        InternalCatalog internalCatalog = Mockito.mock(InternalCatalog.class);
+        Mockito.when(env.getInternalCatalog()).thenReturn(internalCatalog);
+        Mockito.when(internalCatalog.getDbNullable("szt_ods")).thenReturn(targetDatabase);
+        Mockito.when(jdbcClient.getTablesNameList("public")).thenReturn(Arrays.asList("building"));
+        Mockito.when(jdbcClient.getPrimaryKeys("public", "building")).thenReturn(Arrays.asList("id"));
+
+        Map<String, String> nonexistentProps = new HashMap<>();
+        nonexistentProps.put(DataSourceConfigKeys.SCHEMA, "public");
+        nonexistentProps.put(DataSourceConfigKeys.INCLUDE_TABLES, "building");
+        nonexistentProps.put(DataSourceConfigKeys.TABLE + ".building."
+                + DataSourceConfigKeys.TABLE_EXCLUDE_COLUMNS_SUFFIX, "geometry,nonexistent_col");
+
+        Map<String, String> pkExcludeProps = new HashMap<>();
+        pkExcludeProps.put(DataSourceConfigKeys.SCHEMA, "public");
+        pkExcludeProps.put(DataSourceConfigKeys.INCLUDE_TABLES, "building");
+        pkExcludeProps.put(DataSourceConfigKeys.TABLE + ".building."
+                + DataSourceConfigKeys.TABLE_EXCLUDE_COLUMNS_SUFFIX, "id,geometry");
+
+        Map<String, String> unsupportedPkProps = new HashMap<>();
+        unsupportedPkProps.put(DataSourceConfigKeys.SCHEMA, "public");
+        unsupportedPkProps.put(DataSourceConfigKeys.INCLUDE_TABLES, "building");
+        unsupportedPkProps.put(DataSourceConfigKeys.TABLE + ".building."
+                + DataSourceConfigKeys.TABLE_EXCLUDE_COLUMNS_SUFFIX, "geometry");
+
+        try (MockedStatic<Env> mockedEnv = Mockito.mockStatic(Env.class);
+                MockedStatic<StreamingJobUtils> utils = Mockito.mockStatic(StreamingJobUtils.class,
+                        Mockito.CALLS_REAL_METHODS)) {
+            mockedEnv.when(Env::getCurrentEnv).thenReturn(env);
+            utils.when(() -> StreamingJobUtils.getJdbcClient(DataSourceType.POSTGRES, nonexistentProps))
+                    .thenReturn(jdbcClient);
+            utils.when(() -> StreamingJobUtils.getJdbcClient(DataSourceType.POSTGRES, pkExcludeProps))
+                    .thenReturn(jdbcClient);
+            utils.when(() -> StreamingJobUtils.getJdbcClient(DataSourceType.POSTGRES, unsupportedPkProps))
+                    .thenReturn(jdbcClient);
+
+            Mockito.when(jdbcClient.getColumnsFromJdbc("public", "building"))
+                    .thenReturn(buildPostGisBuildingColumns());
+            JobException nonexistentErr = Assertions.assertThrows(JobException.class,
+                    () -> StreamingJobUtils.generateCreateTableCmds(
+                            "szt_ods", DataSourceType.POSTGRES, nonexistentProps, new HashMap<>()));
+            Assertions.assertTrue(nonexistentErr.getMessage().contains("does not exist"));
+            Assertions.assertTrue(nonexistentErr.getMessage().contains("nonexistent_col"));
+
+            Mockito.when(jdbcClient.getColumnsFromJdbc("public", "building"))
+                    .thenReturn(buildPostGisBuildingColumns());
+            JobException pkErr = Assertions.assertThrows(JobException.class,
+                    () -> StreamingJobUtils.generateCreateTableCmds(
+                            "szt_ods", DataSourceType.POSTGRES, pkExcludeProps, new HashMap<>()));
+            Assertions.assertTrue(pkErr.getMessage().contains("primary key"));
+
+            Mockito.when(jdbcClient.getPrimaryKeys("public", "building")).thenReturn(Arrays.asList("geometry"));
+            Mockito.when(jdbcClient.getColumnsFromJdbc("public", "building"))
+                    .thenReturn(buildPostGisBuildingColumns());
+            JobException unsupportedPkErr = Assertions.assertThrows(JobException.class,
+                    () -> StreamingJobUtils.generateCreateTableCmds(
+                            "szt_ods", DataSourceType.POSTGRES, unsupportedPkProps, new HashMap<>()));
+            Assertions.assertTrue(unsupportedPkErr.getMessage().contains("primary key"));
+        }
+    }
+
+    @Test
+    public void testGenerateCreateTableCmdsPrecreatedTargetStillValidatesExcludeColumns() throws Exception {
+        Database targetDatabase = new Database(1L, "szt_ods");
+        targetDatabase.registerTable(new OlapTable(2L, "building", new ArrayList<>(), KeysType.UNIQUE_KEYS,
+                null, null));
+        Env env = Mockito.mock(Env.class);
+        InternalCatalog internalCatalog = Mockito.mock(InternalCatalog.class);
+        Mockito.when(env.getInternalCatalog()).thenReturn(internalCatalog);
+        Mockito.when(internalCatalog.getDbNullable("szt_ods")).thenReturn(targetDatabase);
+        Mockito.when(jdbcClient.getTablesNameList("public")).thenReturn(Arrays.asList("building"));
+        Mockito.when(jdbcClient.getPrimaryKeys("public", "building")).thenReturn(Arrays.asList("id"));
+
+        JdbcFieldSchema idField = Mockito.mock(JdbcFieldSchema.class);
+        Mockito.when(idField.getColumnName()).thenReturn("id");
+        JdbcFieldSchema geomField = Mockito.mock(JdbcFieldSchema.class);
+        Mockito.when(geomField.getColumnName()).thenReturn("geometry");
+        Mockito.when(jdbcClient.getJdbcColumnsInfo("public", "building"))
+                .thenReturn(Arrays.asList(idField, geomField));
+
+        Map<String, String> validProps = new HashMap<>();
+        validProps.put(DataSourceConfigKeys.SCHEMA, "public");
+        validProps.put(DataSourceConfigKeys.INCLUDE_TABLES, "building");
+        validProps.put(DataSourceConfigKeys.TABLE + ".building."
+                + DataSourceConfigKeys.TABLE_EXCLUDE_COLUMNS_SUFFIX, "geometry");
+
+        Map<String, String> invalidProps = new HashMap<>();
+        invalidProps.put(DataSourceConfigKeys.SCHEMA, "public");
+        invalidProps.put(DataSourceConfigKeys.INCLUDE_TABLES, "building");
+        invalidProps.put(DataSourceConfigKeys.TABLE + ".building."
+                + DataSourceConfigKeys.TABLE_EXCLUDE_COLUMNS_SUFFIX, "missing_col");
+
+        try (MockedStatic<Env> mockedEnv = Mockito.mockStatic(Env.class);
+                MockedStatic<StreamingJobUtils> utils = Mockito.mockStatic(StreamingJobUtils.class,
+                        Mockito.CALLS_REAL_METHODS)) {
+            mockedEnv.when(Env::getCurrentEnv).thenReturn(env);
+            utils.when(() -> StreamingJobUtils.getJdbcClient(DataSourceType.POSTGRES, validProps))
+                    .thenReturn(jdbcClient);
+            utils.when(() -> StreamingJobUtils.getJdbcClient(DataSourceType.POSTGRES, invalidProps))
+                    .thenReturn(jdbcClient);
+
+            LinkedHashMap<String, Optional<CreateTableCommand>> cmds = StreamingJobUtils.generateCreateTableCmds(
+                    "szt_ods", DataSourceType.POSTGRES, validProps, new HashMap<>());
+            Assertions.assertFalse(cmds.get("building").isPresent());
+
+            JobException err = Assertions.assertThrows(JobException.class,
+                    () -> StreamingJobUtils.generateCreateTableCmds(
+                            "szt_ods", DataSourceType.POSTGRES, invalidProps, new HashMap<>()));
+            Assertions.assertTrue(err.getMessage().contains("does not exist"));
         }
     }
 }
