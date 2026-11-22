@@ -445,7 +445,7 @@ public class StreamingJobUtils {
                     continue;
                 }
 
-                List<Column> columns = getColumns(jdbcClient, database, table, primaryKeys);
+                List<Column> columns = jdbcClient.getColumnsFromJdbc(database, table);
                 if (!excludeColumns.isEmpty()) {
                     Set<String> columnNames = columns.stream().map(Column::getName).collect(Collectors.toSet());
                     validateExcludeColumns(excludeColumns, table, columnNames, primaryKeys);
@@ -453,6 +453,7 @@ public class StreamingJobUtils {
                             .filter(col -> !excludeColumns.contains(col.getName()))
                             .collect(Collectors.toList());
                 }
+                columns = normalizeColumns(columns, database, table, primaryKeys);
 
                 // Convert Column to ColumnDefinition
                 List<ColumnDefinition> columnDefinitions = columns.stream().map(col -> {
@@ -528,7 +529,14 @@ public class StreamingJobUtils {
             String database,
             String table,
             List<String> primaryKeys) {
-        List<Column> columns = jdbcClient.getColumnsFromJdbc(database, table);
+        return normalizeColumns(jdbcClient.getColumnsFromJdbc(database, table), database, table, primaryKeys);
+    }
+
+    private static List<Column> normalizeColumns(List<Column> rawColumns,
+            String database,
+            String table,
+            List<String> primaryKeys) {
+        List<Column> columns = new ArrayList<>(rawColumns);
         columns.forEach(col -> {
             col.setType(getCdcTransportType(col.getType()));
             Preconditions.checkArgument(!col.getType().isUnsupported(),
